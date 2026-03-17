@@ -1,32 +1,32 @@
 package main
 
+import "base:runtime"
 import "core:fmt"
 import "core:log"
+import "core:mem"
 import "core:os"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
+g_context: runtime.Context
+
 sdl_assert :: proc(ret: bool, loc := #caller_location) {
 	if !ret {
-		fmt.eprintln(loc, "SDL_ERROR:", sdl.GetError())
-		os.exit(1)
+		log.panic(loc, "SDL_ERROR:", sdl.GetError())
 	}
 }
 
 vk_assert :: proc(result: vk.Result, msg: string = "", loc := #caller_location) {
 	if result != .SUCCESS {
-		fmt.eprintln(loc, "VK_ERROR:", msg)
-		os.exit(1)
+		log.panic(loc, "VK_ERROR:", msg)
 	}
 }
-
 
 when ODIN_OS != .Darwin {
 	CHECK_VALIDATION_LAYERS :: true
 } else {
 	CHECK_VALIDATION_LAYERS :: false
 }
-
 
 DEVICE_EXTENSIONS :: []cstring{vk.KHR_SWAPCHAIN_EXTENSION_NAME}
 VALIDATION_LAYERS :: []cstring{"VK_LAYER_KHRONOS_validation"}
@@ -167,7 +167,13 @@ pick_physical_device :: proc(
 }
 
 main :: proc() {
+	logger := log.create_console_logger()
+	context.logger = logger
+
+	g_context = context
+
 	sdl_assert(sdl.Init({.VIDEO}))
+	defer sdl.Quit()
 
 	when ODIN_OS == .Darwin {
 		sdl_assert(
@@ -180,12 +186,12 @@ main :: proc() {
 
 	window := sdl.CreateWindow("DrawDraw", 800, 600, {.VULKAN})
 	sdl_assert(window != nil)
+	defer sdl.DestroyWindow(window)
 
 	vk.load_proc_addresses_global(rawptr(sdl.Vulkan_GetVkGetInstanceProcAddr()))
 
-
 	if CHECK_VALIDATION_LAYERS && !check_validation_layer_support() {
-		fmt.eprintln("validation layers requested, but not available!")
+		log.fatal("validation layers requested, but not available!")
 		os.exit(1)
 	}
 
@@ -203,23 +209,65 @@ main :: proc() {
 		pApplicationInfo = &application_info,
 	}
 
-	// TODO: Add `VK_EXT_DEBUG_UTILS_EXTENSION_NAME` when the validation layers are enabled
-	instance_create_info.ppEnabledExtensionNames = sdl.Vulkan_GetInstanceExtensions(
+	sdl_vk_extensions := sdl.Vulkan_GetInstanceExtensions(
 		&instance_create_info.enabledExtensionCount,
 	)
+
+	when CHECK_VALIDATION_LAYERS {
+		debug_ext_names := make([]cstring, instance_create_info.enabledExtensionCount + 1)
+
+		mem.copy(
+			raw_data(debug_ext_names),
+			sdl_vk_extensions,
+			int(instance_create_info.enabledExtensionCount) * size_of(cstring),
+		)
+
+		debug_ext_names[instance_create_info.enabledExtensionCount] =
+			vk.EXT_DEBUG_UTILS_EXTENSION_NAME
+
+		instance_create_info.enabledExtensionCount += 1
+		instance_create_info.ppEnabledExtensionNames = raw_data(debug_ext_names)
+	} else {
+		instance_create_info.ppEnabledExtensionNames = sdl_vk_extensions
+	}
 
 	if instance_create_info.ppEnabledExtensionNames == nil {
 		log.panic("Failed to get required extensions from SDL")
 	}
 
 	for i in 0 ..< instance_create_info.enabledExtensionCount {
-		fmt.println("Extension:", instance_create_info.ppEnabledExtensionNames[i])
+		log.info("Extension:", instance_create_info.ppEnabledExtensionNames[i])
 	}
 
-	debug_utils_messenger_create_info: vk.DebugUtilsMessengerCreateInfoEXT
-
 	if CHECK_VALIDATION_LAYERS {
-		// TODO: Add the validation layers debug callback
+		instance_create_info.enabledLayerCount = u32(len(VALIDATION_LAYERS))
+		instance_create_info.ppEnabledLayerNames = raw_data(VALIDATION_LAYERS)
+
+		debug_utils_messenger_create_info := vk.DebugUtilsMessengerCreateInfoEXT {
+			sType = .DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
+			messageSeverity = {.VERBOSE, .INFO, .WARNING, .ERROR},
+			messageType = {.GENERAL, .VALIDATION, .PERFORMANCE},
+			pfnUserCallback = proc "c" (
+				severity: vk.DebugUtilsMessageSeverityFlagsEXT,
+				type: vk.DebugUtilsMessageTypeFlagsEXT,
+				data: ^vk.DebugUtilsMessengerCallbackDataEXT,
+				_: rawptr,
+			) -> b32 {
+				context = g_context
+
+				level: log.Level = .Debug
+
+				if .ERROR in severity do level = .Error
+				if .WARNING in severity do level = .Warning
+				if .INFO in severity do level = .Info
+
+				log.log(level, data.pMessage)
+
+				return false
+			},
+		}
+
+		instance_create_info.pNext = &debug_utils_messenger_create_info
 	} else {
 		instance_create_info.enabledLayerCount = 0
 		instance_create_info.pNext = nil
@@ -268,7 +316,12 @@ main :: proc() {
 		pEnabledFeatures        = &device_features,
 		enabledExtensionCount   = u32(len(DEVICE_EXTENSIONS)),
 		ppEnabledExtensionNames = raw_data(DEVICE_EXTENSIONS),
-		enabledLayerCount       = 0, // TODO: validation layers
+		enabledLayerCount       = 0,
+	}
+
+	when CHECK_VALIDATION_LAYERS {
+		device_create_info.enabledLayerCount = u32(len(VALIDATION_LAYERS))
+		device_create_info.ppEnabledLayerNames = raw_data(VALIDATION_LAYERS)
 	}
 
 	device: vk.Device
