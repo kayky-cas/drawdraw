@@ -170,7 +170,11 @@ main :: proc() {
 	sdl_assert(sdl.Init({.VIDEO}))
 
 	when ODIN_OS == .Darwin {
-		sdl_assert(sdl.Vulkan_LoadLibrary("/usr/local/lib/libMoltenVK.dylib"))
+		sdl_assert(
+			sdl.Vulkan_LoadLibrary(
+				"./MoltenVK/Package/Latest/MoltenVK/dynamic/dylib/macOS/libMoltenVK.dylib",
+			),
+		)
 		defer sdl.Vulkan_UnloadLibrary() // I don't know how "when" scopes work
 	}
 
