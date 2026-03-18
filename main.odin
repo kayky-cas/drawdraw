@@ -1,12 +1,21 @@
 package main
 
 import "base:runtime"
+import "core:c"
 import "core:fmt"
 import "core:log"
+import "core:math"
 import "core:mem"
 import "core:os"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
+
+AppState :: struct {
+	window:          ^sdl.Window,
+	physical_device: vk.PhysicalDevice,
+}
+
+state: AppState
 
 g_context: runtime.Context
 
@@ -111,17 +120,10 @@ pick_physical_device :: proc(
 			}
 		}
 
-		surface_format_count: u32
-		vk.GetPhysicalDeviceSurfaceFormatsKHR(device, surface, &surface_format_count, nil)
-
-		surface_present_mode_count: u32
-		vk.GetPhysicalDeviceSurfacePresentModesKHR(
+		surface_format_count, surface_present_mode_count := get_surface_swapchain_counts(
 			device,
 			surface,
-			&surface_present_mode_count,
-			nil,
 		)
-
 
 		if surface_format_count <= 0 || surface_present_mode_count <= 0 {
 			continue
@@ -166,6 +168,103 @@ pick_physical_device :: proc(
 	return nil, -1, -1
 }
 
+get_surface_swapchain_counts :: proc(
+	device: vk.PhysicalDevice,
+	surface: vk.SurfaceKHR,
+) -> (
+	surface_format_count: u32,
+	surface_present_mode_count: u32,
+) {
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(device, surface, &surface_format_count, nil)
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(device, surface, &surface_present_mode_count, nil)
+
+	return
+}
+
+create_swap_chain :: proc(
+	device: vk.PhysicalDevice,
+	surface: vk.SurfaceKHR,
+	allocator := context.allocator,
+) {
+	surface_format_count, surface_present_mode_count := get_surface_swapchain_counts(
+		device,
+		surface,
+	)
+
+	if surface_format_count == 0 {
+		log.panic("Swap chain support not available (no formats)")
+	}
+
+	if surface_present_mode_count == 0 {
+		log.panic("Swap chain support not available (no present modes)")
+	}
+
+	surface_formats := make([]vk.SurfaceFormatKHR, surface_format_count, allocator)
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(
+		device,
+		surface,
+		&surface_format_count,
+		raw_data(surface_formats),
+	)
+
+	surface_format := surface_formats[0]
+
+	for &format in surface_formats {
+		if format.colorSpace == .SRGB_NONLINEAR && format.format == .B8G8R8_SRGB {
+			surface_format = format
+			break
+		}
+	}
+
+	surface_present_modes := make([]vk.PresentModeKHR, surface_present_mode_count, allocator)
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(
+		device,
+		surface,
+		&surface_present_mode_count,
+		raw_data(surface_present_modes),
+	)
+
+	surface_present_mode := surface_present_modes[0]
+
+	for &present_mode in surface_present_modes {
+		if present_mode == .MAILBOX {
+			surface_present_mode = present_mode
+			break
+		}
+	}
+
+	capabilities: vk.SurfaceCapabilitiesKHR
+	vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface, &capabilities)
+
+	swap_chain_extent := choose_swap_extent(&capabilities)
+	log.info("Swap chain extent", swap_chain_extent)
+}
+
+choose_swap_extent :: proc(capabilities: ^vk.SurfaceCapabilitiesKHR) -> vk.Extent2D {
+	if capabilities.currentExtent.width != 0xFFFFFFFF {
+		return capabilities.currentExtent
+	}
+
+	width, height: c.int
+	sdl.GetWindowSize(state.window, &width, &height)
+
+	res: vk.Extent2D
+
+	res.width = math.clamp(
+		u32(width),
+		capabilities.minImageExtent.width,
+		capabilities.maxImageExtent.width,
+	)
+
+	res.height = math.clamp(
+		u32(height),
+		capabilities.minImageExtent.height,
+		capabilities.maxImageExtent.height,
+	)
+
+	return res
+}
+
 main :: proc() {
 	logger := log.create_console_logger()
 	context.logger = logger
@@ -184,9 +283,9 @@ main :: proc() {
 		defer sdl.Vulkan_UnloadLibrary() // I don't know how "when" scopes work
 	}
 
-	window := sdl.CreateWindow("DrawDraw", 800, 600, {.VULKAN})
-	sdl_assert(window != nil)
-	defer sdl.DestroyWindow(window)
+	state.window = sdl.CreateWindow("DrawDraw", 800, 600, {.VULKAN})
+	sdl_assert(state.window != nil)
+	defer sdl.DestroyWindow(state.window)
 
 	vk.load_proc_addresses_global(rawptr(sdl.Vulkan_GetVkGetInstanceProcAddr()))
 
@@ -283,17 +382,17 @@ main :: proc() {
 	vk.load_proc_addresses_instance(instance)
 
 	surface: vk.SurfaceKHR
-	sdl_assert(sdl.Vulkan_CreateSurface(window, instance, nil, &surface))
+	sdl_assert(sdl.Vulkan_CreateSurface(state.window, instance, nil, &surface))
 	defer sdl.Vulkan_DestroySurface(instance, surface, nil)
 
-	p_device, graphic_family, present_family := pick_physical_device(instance, surface)
+	p_device, graphics_family, present_family := pick_physical_device(instance, surface)
 	if p_device == nil {
 		log.panic("Failed to find a suitable GPU")
 	}
 
-	unique_queue_families := []int{graphic_family, present_family}
+	unique_queue_families := []int{graphics_family, present_family}
 
-	queue_create_info_count := int(graphic_family != present_family) + 1
+	queue_create_info_count := int(graphics_family != present_family) + 1
 	queue_create_infos := make([]vk.DeviceQueueCreateInfo, queue_create_info_count)
 	defer delete(queue_create_infos)
 
@@ -330,6 +429,14 @@ main :: proc() {
 		"failed to create logical device",
 	)
 	defer vk.DestroyDevice(device, nil)
+
+	graphics_queue: vk.Queue
+	vk.GetDeviceQueue(device, u32(graphics_family), 0, &graphics_queue)
+
+	present_queue: vk.Queue
+	vk.GetDeviceQueue(device, u32(present_family), 0, &present_queue)
+
+	create_swap_chain(p_device, surface)
 
 	event: sdl.Event
 	quit := false
