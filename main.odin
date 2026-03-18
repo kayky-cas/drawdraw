@@ -2,7 +2,6 @@ package main
 
 import "base:runtime"
 import "core:c"
-import "core:fmt"
 import "core:log"
 import "core:math"
 import "core:mem"
@@ -11,8 +10,11 @@ import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
 AppState :: struct {
-	window:          ^sdl.Window,
-	physical_device: vk.PhysicalDevice,
+	window:   ^sdl.Window,
+	surface:  vk.SurfaceKHR,
+	instance: vk.Instance,
+	p_device: vk.PhysicalDevice,
+	device:   vk.Device,
 }
 
 state: AppState
@@ -69,20 +71,13 @@ check_validation_layer_support :: proc() -> bool {
 	return true
 }
 
-pick_physical_device :: proc(
-	instance: vk.Instance,
-	surface: vk.SurfaceKHR,
-) -> (
-	vk.PhysicalDevice,
-	int,
-	int,
-) {
+pick_physical_device :: proc() -> (vk.PhysicalDevice, int, int) {
 	device_count: u32
-	vk.EnumeratePhysicalDevices(instance, &device_count, nil)
+	vk.EnumeratePhysicalDevices(state.instance, &device_count, nil)
 
 	devices := make([]vk.PhysicalDevice, device_count)
 	defer delete(devices)
-	vk.EnumeratePhysicalDevices(instance, &device_count, raw_data(devices))
+	vk.EnumeratePhysicalDevices(state.instance, &device_count, raw_data(devices))
 
 	device_loop: for device in devices {
 		extension_count: u32
@@ -120,10 +115,7 @@ pick_physical_device :: proc(
 			}
 		}
 
-		surface_format_count, surface_present_mode_count := get_surface_swapchain_counts(
-			device,
-			surface,
-		)
+		surface_format_count, surface_present_mode_count := get_surface_swapchain_counts(device)
 
 		if surface_format_count <= 0 || surface_present_mode_count <= 0 {
 			continue
@@ -153,7 +145,12 @@ pick_physical_device :: proc(
 			}
 
 			present_support: b32
-			vk.GetPhysicalDeviceSurfaceSupportKHR(device, u32(index), surface, &present_support)
+			vk.GetPhysicalDeviceSurfaceSupportKHR(
+				device,
+				u32(index),
+				state.surface,
+				&present_support,
+			)
 
 			if present_support {
 				present_family = index
@@ -169,26 +166,25 @@ pick_physical_device :: proc(
 }
 
 get_surface_swapchain_counts :: proc(
-	device: vk.PhysicalDevice,
-	surface: vk.SurfaceKHR,
+	p_device: vk.PhysicalDevice,
 ) -> (
 	surface_format_count: u32,
 	surface_present_mode_count: u32,
 ) {
-	vk.GetPhysicalDeviceSurfaceFormatsKHR(device, surface, &surface_format_count, nil)
-	vk.GetPhysicalDeviceSurfacePresentModesKHR(device, surface, &surface_present_mode_count, nil)
+	vk.GetPhysicalDeviceSurfaceFormatsKHR(p_device, state.surface, &surface_format_count, nil)
+	vk.GetPhysicalDeviceSurfacePresentModesKHR(
+		p_device,
+		state.surface,
+		&surface_present_mode_count,
+		nil,
+	)
 
 	return
 }
 
-create_swap_chain :: proc(
-	device: vk.PhysicalDevice,
-	surface: vk.SurfaceKHR,
-	allocator := context.allocator,
-) {
+create_swap_chain :: proc(allocator := context.allocator) {
 	surface_format_count, surface_present_mode_count := get_surface_swapchain_counts(
-		device,
-		surface,
+		state.p_device,
 	)
 
 	if surface_format_count == 0 {
@@ -201,8 +197,8 @@ create_swap_chain :: proc(
 
 	surface_formats := make([]vk.SurfaceFormatKHR, surface_format_count, allocator)
 	vk.GetPhysicalDeviceSurfaceFormatsKHR(
-		device,
-		surface,
+		state.p_device,
+		state.surface,
 		&surface_format_count,
 		raw_data(surface_formats),
 	)
@@ -218,8 +214,8 @@ create_swap_chain :: proc(
 
 	surface_present_modes := make([]vk.PresentModeKHR, surface_present_mode_count, allocator)
 	vk.GetPhysicalDeviceSurfacePresentModesKHR(
-		device,
-		surface,
+		state.p_device,
+		state.surface,
 		&surface_present_mode_count,
 		raw_data(surface_present_modes),
 	)
@@ -234,7 +230,7 @@ create_swap_chain :: proc(
 	}
 
 	capabilities: vk.SurfaceCapabilitiesKHR
-	vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(device, surface, &capabilities)
+	vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(state.p_device, state.surface, &capabilities)
 
 	swap_chain_extent := choose_swap_extent(&capabilities)
 	log.info("Swap chain extent", swap_chain_extent)
@@ -289,9 +285,11 @@ main :: proc() {
 
 	vk.load_proc_addresses_global(rawptr(sdl.Vulkan_GetVkGetInstanceProcAddr()))
 
-	if CHECK_VALIDATION_LAYERS && !check_validation_layer_support() {
-		log.fatal("validation layers requested, but not available!")
-		os.exit(1)
+	when CHECK_VALIDATION_LAYERS {
+		if !check_validation_layer_support() {
+			log.fatal("validation layers requested, but not available!")
+			os.exit(1)
+		}
 	}
 
 	application_info := vk.ApplicationInfo {
@@ -338,7 +336,7 @@ main :: proc() {
 		log.info("Extension:", instance_create_info.ppEnabledExtensionNames[i])
 	}
 
-	if CHECK_VALIDATION_LAYERS {
+	when CHECK_VALIDATION_LAYERS {
 		instance_create_info.enabledLayerCount = u32(len(VALIDATION_LAYERS))
 		instance_create_info.ppEnabledLayerNames = raw_data(VALIDATION_LAYERS)
 
@@ -348,7 +346,7 @@ main :: proc() {
 			messageType = {.GENERAL, .VALIDATION, .PERFORMANCE},
 			pfnUserCallback = proc "c" (
 				severity: vk.DebugUtilsMessageSeverityFlagsEXT,
-				type: vk.DebugUtilsMessageTypeFlagsEXT,
+				_: vk.DebugUtilsMessageTypeFlagsEXT,
 				data: ^vk.DebugUtilsMessengerCallbackDataEXT,
 				_: rawptr,
 			) -> b32 {
@@ -372,21 +370,20 @@ main :: proc() {
 		instance_create_info.pNext = nil
 	}
 
-	instance: vk.Instance
 	vk_assert(
-		vk.CreateInstance(&instance_create_info, nil, &instance),
+		vk.CreateInstance(&instance_create_info, nil, &state.instance),
 		"failed to create instance!",
 	)
-	defer vk.DestroyInstance(instance, nil)
+	defer vk.DestroyInstance(state.instance, nil)
 
-	vk.load_proc_addresses_instance(instance)
+	vk.load_proc_addresses_instance(state.instance)
 
-	surface: vk.SurfaceKHR
-	sdl_assert(sdl.Vulkan_CreateSurface(state.window, instance, nil, &surface))
-	defer sdl.Vulkan_DestroySurface(instance, surface, nil)
+	sdl_assert(sdl.Vulkan_CreateSurface(state.window, state.instance, nil, &state.surface))
+	defer sdl.Vulkan_DestroySurface(state.instance, state.surface, nil)
 
-	p_device, graphics_family, present_family := pick_physical_device(instance, surface)
-	if p_device == nil {
+	graphics_family, present_family: int
+	state.p_device, graphics_family, present_family = pick_physical_device()
+	if state.p_device == nil {
 		log.panic("Failed to find a suitable GPU")
 	}
 
@@ -423,20 +420,21 @@ main :: proc() {
 		device_create_info.ppEnabledLayerNames = raw_data(VALIDATION_LAYERS)
 	}
 
-	device: vk.Device
 	vk_assert(
-		vk.CreateDevice(p_device, &device_create_info, nil, &device),
+		vk.CreateDevice(state.p_device, &device_create_info, nil, &state.device),
 		"failed to create logical device",
 	)
-	defer vk.DestroyDevice(device, nil)
+	defer vk.DestroyDevice(state.device, nil)
+
+	vk.load_proc_addresses_device(state.device)
 
 	graphics_queue: vk.Queue
-	vk.GetDeviceQueue(device, u32(graphics_family), 0, &graphics_queue)
+	vk.GetDeviceQueue(state.device, u32(graphics_family), 0, &graphics_queue)
 
 	present_queue: vk.Queue
-	vk.GetDeviceQueue(device, u32(present_family), 0, &present_queue)
+	vk.GetDeviceQueue(state.device, u32(present_family), 0, &present_queue)
 
-	create_swap_chain(p_device, surface)
+	create_swap_chain()
 
 	event: sdl.Event
 	quit := false
