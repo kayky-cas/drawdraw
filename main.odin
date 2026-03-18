@@ -9,17 +9,14 @@ import "core:os"
 import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
-AppState :: struct {
+state: struct {
 	window:   ^sdl.Window,
 	surface:  vk.SurfaceKHR,
 	instance: vk.Instance,
 	p_device: vk.PhysicalDevice,
 	device:   vk.Device,
+	ctx:      runtime.Context,
 }
-
-state: AppState
-
-g_context: runtime.Context
 
 sdl_assert :: proc(ret: bool, loc := #caller_location) {
 	if !ret {
@@ -244,28 +241,25 @@ choose_swap_extent :: proc(capabilities: ^vk.SurfaceCapabilitiesKHR) -> vk.Exten
 	width, height: c.int
 	sdl.GetWindowSize(state.window, &width, &height)
 
-	res: vk.Extent2D
-
-	res.width = math.clamp(
-		u32(width),
-		capabilities.minImageExtent.width,
-		capabilities.maxImageExtent.width,
-	)
-
-	res.height = math.clamp(
-		u32(height),
-		capabilities.minImageExtent.height,
-		capabilities.maxImageExtent.height,
-	)
-
-	return res
+	return vk.Extent2D {
+		width = math.clamp(
+			u32(width),
+			capabilities.minImageExtent.width,
+			capabilities.maxImageExtent.width,
+		),
+		height = math.clamp(
+			u32(height),
+			capabilities.minImageExtent.height,
+			capabilities.maxImageExtent.height,
+		),
+	}
 }
 
 main :: proc() {
 	logger := log.create_console_logger()
 	context.logger = logger
 
-	g_context = context
+	state.ctx = context
 
 	sdl_assert(sdl.Init({.VIDEO}))
 	defer sdl.Quit()
@@ -350,7 +344,7 @@ main :: proc() {
 				data: ^vk.DebugUtilsMessengerCallbackDataEXT,
 				_: rawptr,
 			) -> b32 {
-				context = g_context
+				context = state.ctx
 
 				level: log.Level = .Debug
 
@@ -412,7 +406,6 @@ main :: proc() {
 		pEnabledFeatures        = &device_features,
 		enabledExtensionCount   = u32(len(DEVICE_EXTENSIONS)),
 		ppEnabledExtensionNames = raw_data(DEVICE_EXTENSIONS),
-		enabledLayerCount       = 0,
 	}
 
 	when CHECK_VALIDATION_LAYERS {
