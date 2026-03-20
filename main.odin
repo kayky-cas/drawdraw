@@ -10,12 +10,14 @@ import sdl "vendor:sdl3"
 import vk "vendor:vulkan"
 
 state: struct {
-	window:   ^sdl.Window,
-	surface:  vk.SurfaceKHR,
-	instance: vk.Instance,
-	p_device: vk.PhysicalDevice,
-	device:   vk.Device,
-	ctx:      runtime.Context,
+	window:          ^sdl.Window,
+	surface:         vk.SurfaceKHR,
+	instance:        vk.Instance,
+	p_device:        vk.PhysicalDevice,
+	graphics_family: u32,
+	present_family:  u32,
+	device:          vk.Device,
+	ctx:             runtime.Context,
 }
 
 sdl_assert :: proc(ret: bool, loc := #caller_location) {
@@ -68,7 +70,7 @@ check_validation_layer_support :: proc() -> bool {
 	return true
 }
 
-pick_physical_device :: proc() -> (vk.PhysicalDevice, int, int) {
+pick_physical_device :: proc() -> (vk.PhysicalDevice, Maybe(u32), Maybe(u32)) {
 	device_count: u32
 	vk.EnumeratePhysicalDevices(state.instance, &device_count, nil)
 
@@ -133,12 +135,12 @@ pick_physical_device :: proc() -> (vk.PhysicalDevice, int, int) {
 			raw_data(queue_families),
 		)
 
-		graphic_family := -1
-		present_family := -1
+		graphic_family: Maybe(u32) = nil
+		present_family: Maybe(u32) = nil
 
 		for &queue_family, index in queue_families {
 			if vk.QueueFlag.GRAPHICS in queue_family.queueFlags {
-				graphic_family = index
+				graphic_family = u32(index)
 			}
 
 			present_support: b32
@@ -150,16 +152,16 @@ pick_physical_device :: proc() -> (vk.PhysicalDevice, int, int) {
 			)
 
 			if present_support {
-				present_family = index
+				present_family = u32(index)
 			}
 
-			if present_family != -1 && graphic_family != -1 {
+			if present_family != nil && graphic_family != nil {
 				return device, graphic_family, present_family
 			}
 		}
 	}
 
-	return nil, -1, -1
+	return nil, nil, nil
 }
 
 get_surface_swapchain_counts :: proc(
@@ -179,7 +181,7 @@ get_surface_swapchain_counts :: proc(
 	return
 }
 
-create_swap_chain :: proc(allocator := context.allocator) {
+create_swap_chain :: proc(allocator := context.allocator) -> vk.SwapchainKHR {
 	surface_format_count, surface_present_mode_count := get_surface_swapchain_counts(
 		state.p_device,
 	)
@@ -231,6 +233,41 @@ create_swap_chain :: proc(allocator := context.allocator) {
 
 	swap_chain_extent := choose_swap_extent(&capabilities)
 	log.info("Swap chain extent", swap_chain_extent)
+
+	image_count := math.max(capabilities.minImageCount + 1, capabilities.maxImageCount)
+
+	create_info := vk.SwapchainCreateInfoKHR {
+		sType            = .SWAPCHAIN_CREATE_INFO_KHR,
+		surface          = state.surface,
+		minImageCount    = image_count,
+		imageFormat      = surface_format.format,
+		imageColorSpace  = surface_format.colorSpace,
+		imageExtent      = swap_chain_extent,
+		imageArrayLayers = 1,
+		imageUsage       = {.COLOR_ATTACHMENT},
+		preTransform     = capabilities.currentTransform,
+		compositeAlpha   = {.OPAQUE},
+		presentMode      = surface_present_mode,
+		clipped          = true,
+	}
+
+	queue_family_indices := []u32{state.graphics_family, state.present_family}
+
+	if state.graphics_family != state.present_family {
+		create_info.imageSharingMode = .CONCURRENT
+		create_info.queueFamilyIndexCount = 2
+		create_info.pQueueFamilyIndices = raw_data(queue_family_indices)
+	} else {
+		create_info.imageSharingMode = .EXCLUSIVE
+	}
+
+	swap_chain: vk.SwapchainKHR
+	vk_assert(
+		vk.CreateSwapchainKHR(state.device, &create_info, nil, &swap_chain),
+		"failed to create swap chain",
+	)
+
+	return swap_chain
 }
 
 choose_swap_extent :: proc(capabilities: ^vk.SurfaceCapabilitiesKHR) -> vk.Extent2D {
@@ -375,15 +412,19 @@ main :: proc() {
 	sdl_assert(sdl.Vulkan_CreateSurface(state.window, state.instance, nil, &state.surface))
 	defer sdl.Vulkan_DestroySurface(state.instance, state.surface, nil)
 
-	graphics_family, present_family: int
+	graphics_family, present_family: Maybe(u32)
 	state.p_device, graphics_family, present_family = pick_physical_device()
-	if state.p_device == nil {
+
+	if state.p_device == nil || graphics_family == nil || present_family == nil {
 		log.panic("Failed to find a suitable GPU")
 	}
 
-	unique_queue_families := []int{graphics_family, present_family}
+	state.graphics_family = graphics_family.(u32)
+	state.present_family = present_family.(u32)
 
-	queue_create_info_count := int(graphics_family != present_family) + 1
+	unique_queue_families := []u32{state.graphics_family, state.present_family}
+
+	queue_create_info_count := u32(state.graphics_family != state.present_family) + 1
 	queue_create_infos := make([]vk.DeviceQueueCreateInfo, queue_create_info_count)
 	defer delete(queue_create_infos)
 
@@ -391,7 +432,7 @@ main :: proc() {
 	for i in 0 ..< queue_create_info_count {
 		queue_create_infos[i] = vk.DeviceQueueCreateInfo {
 			sType            = .DEVICE_QUEUE_CREATE_INFO,
-			queueFamilyIndex = u32(unique_queue_families[i]),
+			queueFamilyIndex = unique_queue_families[i],
 			queueCount       = 1,
 			pQueuePriorities = &queue_priority,
 		}
@@ -422,12 +463,13 @@ main :: proc() {
 	vk.load_proc_addresses_device(state.device)
 
 	graphics_queue: vk.Queue
-	vk.GetDeviceQueue(state.device, u32(graphics_family), 0, &graphics_queue)
+	vk.GetDeviceQueue(state.device, state.graphics_family, 0, &graphics_queue)
 
 	present_queue: vk.Queue
-	vk.GetDeviceQueue(state.device, u32(present_family), 0, &present_queue)
+	vk.GetDeviceQueue(state.device, state.present_family, 0, &present_queue)
 
-	create_swap_chain()
+	swap_chain := create_swap_chain()
+	defer vk.DestroySwapchainKHR(state.device, swap_chain, nil)
 
 	event: sdl.Event
 	quit := false
